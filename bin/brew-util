@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 
+BREW_CONFIG_DIR="$HOME/Config/brew"
+EXCLUDE_FILE="$BREW_CONFIG_DIR/.exclude"
+
 require_brewfile() {
   if [[ ! -f "${HOMEBREW_BUNDLE_FILE_GLOBAL:-}" ]]; then
     echo "Error: Global Brewfile not found at ${HOMEBREW_BUNDLE_FILE_GLOBAL:-<unset>}"
@@ -8,16 +11,61 @@ require_brewfile() {
   fi
 }
 
+# Read exclusion list (ignores blank lines and # comments)
+load_exclusions() {
+  if [[ ! -f "$EXCLUDE_FILE" ]]; then
+    echo ""
+    return
+  fi
+  grep -v '^\s*#' "$EXCLUDE_FILE" | grep -v '^\s*$' || true
+}
+
+_greedy_upgrade() {
+  local -a outdated=()
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && outdated+=("$pkg")
+  done < <(brew outdated --greedy --cask --verbose 2>/dev/null | awk '{print $1}')
+
+  if [[ ${#outdated[@]} -eq 0 ]]; then
+    echo "No greedy updates available."
+    return 0
+  fi
+
+  local exclusions
+  exclusions=$(load_exclusions)
+
+  local -a to_upgrade=()
+  for pkg in "${outdated[@]}"; do
+    if echo "$exclusions" | grep -qx "$pkg" 2>/dev/null; then
+      echo "Skipping (excluded): $pkg"
+    else
+      to_upgrade+=("$pkg")
+    fi
+  done
+
+  if [[ ${#to_upgrade[@]} -eq 0 ]]; then
+    echo "No greedy updates to apply (all excluded)."
+    return 0
+  fi
+
+  echo "Upgrading (greedy): ${to_upgrade[*]}"
+  brew upgrade --cask "${to_upgrade[@]}"
+}
+
 case "${1:-}" in
   --help)
     echo "Usage: brew-util <command>"
     echo ""
     echo "Commands:"
-    echo "  list      List all packages in global Brewfile"
-    echo "  update    Update Brew, upgrade packages from global .Brewfile, run doctor (bre-util save is run implicitly)"
-    echo "  install   Install Homebrew and all packages from global Brewfile"
-    echo "  save      Save current Brew packages to global Brewfile"
-    echo "  --help    Show this help message"
+    echo "  list                 List all packages in global Brewfile"
+    echo "  update [--greedy]    Update Brew, upgrade packages from global Brewfile, run doctor"
+    echo "                       Pass --greedy to also upgrade auto-update/latest casks (exclusions apply)"
+    echo "  install              Install Homebrew and all packages from global Brewfile"
+    echo "  save                 Save current Brew packages to global Brewfile"
+    echo "  exclude add <cask>   Add a cask to the greedy upgrade exclusion list"
+    echo "  exclude rm <cask>    Remove a cask from the greedy upgrade exclusion list"
+    echo "  exclude list         Show excluded casks"
+    echo "  --help               Show this help message"
     ;;
 
   list)
@@ -35,8 +83,9 @@ case "${1:-}" in
     require_brewfile
     brew update --force
     brew-util save
-    brew bundle install --global --upgrade --cleanup --quiet
-    echo "Brew update complete."
+    brew bundle install --global --upgrade --cleanup --verbose
+    echo "Brew bundle update complete."
+    [[ "${2:-}" == "--greedy" ]] && _greedy_upgrade
     brew doctor || true
     brew autoremove || true
     echo "Brew maintenance complete."
@@ -46,6 +95,45 @@ case "${1:-}" in
     require_brewfile
     brew bundle dump --global --force --no-vscode
     echo "Brew packages saved to $HOMEBREW_BUNDLE_FILE_GLOBAL"
+    ;;
+
+  exclude)
+    case "${2:-}" in
+      list)
+        if [[ ! -f "$EXCLUDE_FILE" ]]; then
+          echo "No exclusions configured."
+        else
+          echo "Excluded casks ($EXCLUDE_FILE):"
+          load_exclusions | sed 's/^/  /'
+        fi
+        ;;
+      add)
+        [[ -z "${3:-}" ]] && { echo "Usage: brew-util exclude add <cask>"; exit 1; }
+        mkdir -p "$BREW_CONFIG_DIR"
+        if load_exclusions | grep -qx "$3" 2>/dev/null; then
+          echo "$3 is already excluded."
+        else
+          echo "$3" >> "$EXCLUDE_FILE"
+          echo "Added $3 to exclusion list."
+        fi
+        ;;
+      rm)
+        [[ -z "${3:-}" ]] && { echo "Usage: brew-util exclude rm <cask>"; exit 1; }
+        if [[ ! -f "$EXCLUDE_FILE" ]]; then
+          echo "$3 not found in exclusion list."
+        else
+          local tmp
+          tmp=$(mktemp)
+          grep -v "^${3}$" "$EXCLUDE_FILE" > "$tmp" || true
+          mv "$tmp" "$EXCLUDE_FILE"
+          echo "Removed $3 from exclusion list."
+        fi
+        ;;
+      *)
+        echo "Usage: brew-util exclude <list|add|rm> [cask]"
+        exit 1
+        ;;
+    esac
     ;;
 
   "")
